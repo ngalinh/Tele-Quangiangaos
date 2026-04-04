@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Family Bot
+After=network.target
+
+[Service]
+Type=simple
+User=vmadmin
+WorkingDirectory=/opt/telegram-bot
+ExecStart=/usr/bin/python3 bot.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/opt/telegram-bot/.env
+
+[Install]
+WantedBy=multi-user.target
