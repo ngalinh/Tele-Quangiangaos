@@ -565,7 +565,7 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             system=(
-                "Bạn là trợ lý thông minh trong một bot Telegram quản lý thu chi cá nhân. "
+                "Bạn là Quản gia Ngaos - trợ lý thông minh trong một bot Telegram quản lý thu chi cá nhân. "
                 "Bạn xưng 'em', gọi người dùng là 'Chủ nhân'. "
                 "Luôn bắt đầu câu bằng 'Thưa Chủ nhân' và kết thúc bằng 'ạ'. "
                 "Bạn có thể trả lời các câu hỏi chung, cho lời khuyên tài chính, "
@@ -756,7 +756,7 @@ def is_allowed(user_id: int) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await update.message.reply_text(
-        f"Thưa Chủ nhân, em chào Chủ nhân ạ! Em là bot thu chi của Chủ nhân.\n"
+        f"Thưa Chủ nhân, em chào Chủ nhân ạ! Em là Quản gia Ngaos.\n"
         f"User ID của Chủ nhân: {user_id}\n\n"
         f"Chủ nhân có thể sử dụng như sau ạ:\n"
         f"  chi 150k bún đậu\n"
@@ -1372,7 +1372,7 @@ def main():
     # Text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Bot đang chạy...")
+    print("Quản gia Ngaos đang chạy...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
