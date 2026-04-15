@@ -35,7 +35,7 @@ VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 # --- Config ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
-GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "")
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -93,7 +93,10 @@ def get_sheet():
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = Credentials.from_service_account_file(GOOGLE_CREDENTIALS_FILE, scopes=scopes)
+    if not GOOGLE_CREDENTIALS_JSON:
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON env var is not set")
+    creds_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
     year = datetime.now(VN_TZ).year
