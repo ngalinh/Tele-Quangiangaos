@@ -5,6 +5,7 @@ import logging
 import time
 import subprocess
 import unicodedata
+import uuid
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple
@@ -96,6 +97,10 @@ MEDICATION_CHAIN = {
 }
 MED_CALLBACK_MAP = {"sat": "sắt", "vitamin": "vitamin"}
 MED_INTERVAL_HOURS = 2
+MED_DELETE_WINDOW_SECONDS = 120  # 2 minutes to delete after saving
+
+# Pending confirmations waiting for Lưu lại / Huỷ (in-memory)
+pending_med_confirmations: dict = {}  # {token: {"medication", "chat_id", "user_id"}}
 
 
 def get_sheet():
@@ -587,20 +592,44 @@ def save_medication_history(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def log_medication(user_id: int, medication: str) -> datetime:
-    """Append medication entry to history. Returns timestamp logged."""
+def log_medication(user_id: int, medication: str, next_job_name: Optional[str] = None) -> dict:
+    """Append medication entry to history. Returns the stored entry."""
     history = load_medication_history()
     key = str(user_id)
     if key not in history:
         history[key] = []
     now = datetime.now(VN_TZ)
-    history[key].append({
+    entry = {
+        "id": uuid.uuid4().hex[:10],
+        "timestamp": now.isoformat(),
         "date": now.strftime("%Y-%m-%d"),
         "time": now.strftime("%H:%M"),
         "medication": medication,
-    })
+        "next_job_name": next_job_name,
+    }
+    history[key].append(entry)
     save_medication_history(history)
-    return now
+    return entry
+
+
+def find_medication_entry(user_id: int, entry_id: str) -> Optional[dict]:
+    history = load_medication_history()
+    for item in history.get(str(user_id), []):
+        if item.get("id") == entry_id:
+            return item
+    return None
+
+
+def delete_medication_entry(user_id: int, entry_id: str) -> Optional[dict]:
+    history = load_medication_history()
+    key = str(user_id)
+    items = history.get(key, [])
+    for i, item in enumerate(items):
+        if item.get("id") == entry_id:
+            removed = items.pop(i)
+            save_medication_history(history)
+            return removed
+    return None
 
 
 async def send_medication_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -619,15 +648,15 @@ async def send_medication_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, current_med: str) -> Optional[Tuple[str, datetime]]:
-    """Schedule the next medication reminder. Returns (next_med_name, reminder_time) or None if last in chain."""
+def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, current_med: str) -> Optional[Tuple[str, datetime, str]]:
+    """Schedule next medication reminder. Returns (next_med, reminder_time, job_name) or None."""
     next_med, next_key = MEDICATION_CHAIN[current_med]
     if not next_med:
         return None
 
     now = datetime.now(VN_TZ)
     reminder_time = now + timedelta(hours=MED_INTERVAL_HOURS)
-    job_name = f"med_{chat_id}_{int(now.timestamp())}"
+    job_name = f"medreminder_{chat_id}_{uuid.uuid4().hex[:8]}"
 
     context.job_queue.run_once(
         send_medication_reminder,
@@ -636,27 +665,160 @@ def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, c
         name=job_name,
         chat_id=chat_id,
     )
-    return next_med, reminder_time
+    return next_med, reminder_time, job_name
+
+
+async def remove_delete_button(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback - remove the Xoá button after the delete window expires."""
+    job = context.job
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=job.data["chat_id"],
+            message_id=job.data["message_id"],
+            reply_markup=None,
+        )
+    except Exception as e:
+        logger.info(f"remove_delete_button skipped: {e}")
+
+
+async def show_medication_confirmation(target, context: ContextTypes.DEFAULT_TYPE, medication: str, is_query: bool) -> None:
+    """Show 'Lưu lại / Huỷ' confirmation for a medication."""
+    token = uuid.uuid4().hex[:10]
+    if is_query:
+        chat_id = target.message.chat_id
+        user_id = target.from_user.id
+    else:
+        chat_id = target.chat_id
+        user_id = target.from_user.id
+
+    pending_med_confirmations[token] = {
+        "medication": medication,
+        "chat_id": chat_id,
+        "user_id": user_id,
+    }
+
+    now = datetime.now(VN_TZ)
+    text = (
+        f"Thưa Chủ nhân, em xin xác nhận ạ:\n\n"
+        f"  💊 Uống {medication}\n"
+        f"  Thời gian: {now.strftime('%H:%M %d/%m/%Y')}\n\n"
+        f"Chủ nhân có muốn em lưu vào lịch sử không ạ?"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Lưu lại", callback_data=f"medsave_{token}"),
+        InlineKeyboardButton("Huỷ", callback_data=f"medskip_{token}"),
+    ]])
+
+    if is_query:
+        await target.edit_message_text(text, reply_markup=keyboard)
+    else:
+        await target.reply_text(text, reply_markup=keyboard)
 
 
 async def handle_medication_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 'đã uống canxi' text message - log it and schedule sắt reminder."""
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
+    """Handle 'đã uống canxi' text - show Lưu/Huỷ confirmation."""
+    await show_medication_confirmation(update.message, context, "canxi", is_query=False)
 
-    logged_at = log_medication(user_id, "canxi")
-    scheduled = schedule_next_medication(context, chat_id, "canxi")
+
+async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    token = query.data.replace("medsave_", "")
+    pending = pending_med_confirmations.pop(token, None)
+    if not pending:
+        await query.edit_message_text("Thưa Chủ nhân, xác nhận này đã hết hạn ạ.")
+        return
+
+    medication = pending["medication"]
+    chat_id = pending["chat_id"]
+    user_id = pending["user_id"]
+
+    scheduled = schedule_next_medication(context, chat_id, medication)
+    next_job_name = scheduled[2] if scheduled else None
+    entry = log_medication(user_id, medication, next_job_name=next_job_name)
 
     if scheduled:
-        next_med, reminder_time = scheduled
-        await update.message.reply_text(
-            f"Thưa Chủ nhân, em đã ghi nhận Chủ nhân uống canxi lúc {logged_at.strftime('%H:%M')} ạ.\n"
-            f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ."
+        next_med, reminder_time, _ = scheduled
+        text = (
+            f"Thưa Chủ nhân, em đã lưu lịch sử ạ:\n\n"
+            f"  💊 Uống {medication} lúc {entry['time']} ngày {datetime.fromisoformat(entry['timestamp']).strftime('%d/%m/%Y')}\n\n"
+            f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ.\n\n"
+            f"(Chủ nhân có thể xoá lịch sử này trong 2 phút)"
         )
+    else:
+        text = (
+            f"Thưa Chủ nhân, em đã lưu lịch sử ạ:\n\n"
+            f"  💊 Uống {medication} lúc {entry['time']} ngày {datetime.fromisoformat(entry['timestamp']).strftime('%d/%m/%Y')}\n\n"
+            f"Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉\n\n"
+            f"(Chủ nhân có thể xoá lịch sử này trong 2 phút)"
+        )
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Xoá", callback_data=f"meddel_{entry['id']}")
+    ]])
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+    context.job_queue.run_once(
+        remove_delete_button,
+        when=MED_DELETE_WINDOW_SECONDS,
+        data={"chat_id": chat_id, "message_id": query.message.message_id},
+        name=f"medxoa_{entry['id']}",
+    )
+
+
+async def _medication_skip(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    token = query.data.replace("medskip_", "")
+    pending = pending_med_confirmations.pop(token, None)
+    medication = pending["medication"] if pending else "thuốc"
+    await query.edit_message_text(
+        f"Thưa Chủ nhân, em đã huỷ ghi nhận uống {medication} ạ. Không có gì được lưu lại."
+    )
+
+
+async def _medication_delete(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    entry_id = query.data.replace("meddel_", "")
+    entry = find_medication_entry(query.from_user.id, entry_id)
+    if not entry:
+        await query.edit_message_text("Thưa Chủ nhân, lịch sử này không còn ạ.")
+        return
+
+    try:
+        logged_at = datetime.fromisoformat(entry["timestamp"])
+    except Exception:
+        logged_at = None
+
+    now = datetime.now(VN_TZ)
+    if logged_at is None or (now - logged_at).total_seconds() > MED_DELETE_WINDOW_SECONDS:
+        await query.edit_message_reply_markup(reply_markup=None)
+        return
+
+    next_job_name = entry.get("next_job_name")
+    if next_job_name:
+        for job in context.job_queue.get_jobs_by_name(next_job_name):
+            job.schedule_removal()
+
+    delete_medication_entry(query.from_user.id, entry_id)
+
+    cancelled_note = ""
+    if next_job_name:
+        next_med, _ = MEDICATION_CHAIN.get(entry["medication"], (None, None))
+        if next_med:
+            cancelled_note = f"\nEm cũng đã huỷ nhắc nhở uống {next_med} ạ."
+
+    await query.edit_message_text(
+        f"Thưa Chủ nhân, em đã xoá lịch sử uống {entry['medication']} lúc {entry['time']} ạ.{cancelled_note}"
+    )
+
+
+async def _medication_reminder_click(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Đã uống sắt / vitamin' buttons from reminder messages."""
+    key = query.data.replace("med_", "")
+    medication = MED_CALLBACK_MAP.get(key)
+    if not medication:
+        return
+    await show_medication_confirmation(query, context, medication, is_query=True)
 
 
 async def handle_medication_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 'Đã uống sắt' / 'Đã uống vitamin' button presses."""
+    """Dispatcher for all medication-related callbacks."""
     query = update.callback_query
     await query.answer()
 
@@ -664,25 +826,15 @@ async def handle_medication_callback(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("Thưa Chủ nhân, em không nhận ra Chủ nhân ạ.")
         return
 
-    key = query.data.replace("med_", "")
-    medication = MED_CALLBACK_MAP.get(key)
-    if not medication:
-        return
-
-    logged_at = log_medication(query.from_user.id, medication)
-    scheduled = schedule_next_medication(context, query.message.chat_id, medication)
-
-    if scheduled:
-        next_med, reminder_time = scheduled
-        await query.edit_message_text(
-            f"Thưa Chủ nhân, em đã ghi nhận Chủ nhân uống {medication} lúc {logged_at.strftime('%H:%M')} ạ.\n"
-            f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ."
-        )
-    else:
-        await query.edit_message_text(
-            f"Thưa Chủ nhân, em đã ghi nhận Chủ nhân uống {medication} lúc {logged_at.strftime('%H:%M')} ạ.\n"
-            f"Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉"
-        )
+    data = query.data
+    if data.startswith("medsave_"):
+        await _medication_save(query, context)
+    elif data.startswith("medskip_"):
+        await _medication_skip(query, context)
+    elif data.startswith("meddel_"):
+        await _medication_delete(query, context)
+    elif data.startswith("med_"):
+        await _medication_reminder_click(query, context)
 
 
 async def thuoc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1538,7 +1690,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_delete_callback, pattern=r"^(del_|confirm_del_|cancel_del)"))
     app.add_handler(CallbackQueryHandler(handle_edit_callback, pattern=r"^(edit_|editcat_)"))
     app.add_handler(CallbackQueryHandler(handle_ocr_callback, pattern=r"^ocr_"))
-    app.add_handler(CallbackQueryHandler(handle_medication_callback, pattern=r"^med_"))
+    app.add_handler(CallbackQueryHandler(handle_medication_callback, pattern=r"^med"))
 
     # Text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
