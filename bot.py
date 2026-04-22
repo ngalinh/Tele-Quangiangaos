@@ -720,6 +720,65 @@ async def handle_medication_text(update: Update, context: ContextTypes.DEFAULT_T
     await show_medication_confirmation(update.message, context, "canxi", is_query=False)
 
 
+def parse_med_reminder_request(text: str) -> Optional[dict]:
+    """Parse 'nhắc uống sắt/vitamin trong X phút/tiếng' into {medication, key, delay_seconds}."""
+    normalized = unicodedata.normalize("NFC", text.lower())
+
+    if "nhắc" not in normalized and "nhac" not in normalized:
+        return None
+
+    if "uống sắt" in normalized or "uong sat" in normalized:
+        medication, med_key = "sắt", "sat"
+    elif "uống vitamin" in normalized or "uong vitamin" in normalized:
+        medication, med_key = "vitamin", "vitamin"
+    else:
+        return None
+
+    m = re.search(r'(\d+)\s*(phút|phut|tiếng|tieng|giờ|gio)', normalized)
+    if not m:
+        return None
+
+    num = int(m.group(1))
+    unit = m.group(2)
+    delay_seconds = num * 60 if unit in ("phút", "phut") else num * 3600
+    if delay_seconds <= 0:
+        return None
+
+    return {"medication": medication, "med_key": med_key, "delay_seconds": delay_seconds}
+
+
+async def handle_med_reminder_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE, parsed: dict) -> None:
+    """Schedule a manual medication reminder (for when user forgot the chain)."""
+    chat_id = update.effective_chat.id
+    medication = parsed["medication"]
+    med_key = parsed["med_key"]
+    delay = parsed["delay_seconds"]
+
+    now = datetime.now(VN_TZ)
+    reminder_time = now + timedelta(seconds=delay)
+    job_name = f"medreminder_{chat_id}_{uuid.uuid4().hex[:8]}"
+
+    context.job_queue.run_once(
+        send_medication_reminder,
+        when=delay,
+        data={"next_medication": medication, "next_key": med_key},
+        name=job_name,
+        chat_id=chat_id,
+    )
+
+    if delay >= 3600:
+        hours, rem = divmod(delay, 3600)
+        mins = rem // 60
+        time_str = f"{hours} tiếng" + (f" {mins} phút" if mins else "")
+    else:
+        time_str = f"{delay // 60} phút"
+
+    await update.message.reply_text(
+        f"Thưa Chủ nhân, em đã đặt nhắc uống {medication} sau {time_str} nữa ạ.\n"
+        f"Thời gian: {reminder_time.strftime('%H:%M ngày %d/%m/%Y')}"
+    )
+
+
 async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     token = query.data.replace("medsave_", "")
     pending = pending_med_confirmations.pop(token, None)
@@ -1092,6 +1151,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Nhắn: đã uống canxi - Bắt đầu chuỗi nhắc\n"
         f"  Sau 2h em sẽ nhắc uống sắt (kèm nút)\n"
         f"  Sau 2h nữa em sẽ nhắc uống vitamin (kèm nút)\n"
+        f"  Nhắc thủ công: nhắc uống sắt 30 phút nữa\n"
+        f"                 nhắc uống vitamin 1 tiếng nữa\n"
         f"  /thuoc - Xem lịch sử uống thuốc\n\n"
         f"Trợ lý AI ạ:\n"
         f"  Chủ nhân xinh đẹp cứ nhắn bất kỳ câu hỏi nào, em sẽ trả lời ạ!\n\n"
@@ -1509,13 +1570,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower = text.lower().strip()
     normalized = unicodedata.normalize("NFC", lower)
 
-    # 1) Medication - "đã uống canxi" starts the daily chain
-    if "uống canxi" in normalized or "uong canxi" in normalized:
+    # 1) Medication taken - "đã uống canxi" starts the daily chain
+    if "đã uống canxi" in normalized or "da uong canxi" in normalized:
         logger.info(f"Medication trigger: canxi from user {update.effective_user.id}")
         await handle_medication_text(update, context)
         return
 
-    # 2) Reminder request
+    # 2) Manual medication reminder - "nhắc uống sắt/vitamin X phút/tiếng nữa"
+    med_reminder = parse_med_reminder_request(text)
+    if med_reminder:
+        await handle_med_reminder_schedule(update, context, med_reminder)
+        return
+
+    # 3) Generic reminder request
     reminder_keywords = ("nhắc", "nhac", "nhớ", "nho ", "hẹn", "hen ",
                          "phút nữa", "phut nua", "tiếng nữa", "tieng nua",
                          "remind", "alarm", "báo thức", "bao thuc")
@@ -1523,7 +1590,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_reminder_request(update, context, text)
         return
 
-    # 3) Thu/chi transaction
+    # 4) Thu/chi transaction
     data = parse_message(text)
     if data is None:
         if lower.startswith("thu") or lower.startswith("chi"):
@@ -1533,7 +1600,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  thu 5tr lương"
             )
             return
-        # 4) AI assistant fallback
+        # 5) AI assistant fallback
         await handle_ai_chat(update, context, text)
         return
 
