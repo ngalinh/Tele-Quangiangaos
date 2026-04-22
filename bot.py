@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import subprocess
+import unicodedata
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple
@@ -1354,9 +1355,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lower = text.lower().strip()
+    normalized = unicodedata.normalize("NFC", lower)
 
     # 1) Medication - "đã uống canxi" starts the daily chain
-    if lower in ("đã uống canxi", "da uong canxi"):
+    if "uống canxi" in normalized or "uong canxi" in normalized:
+        logger.info(f"Medication trigger: canxi from user {update.effective_user.id}")
         await handle_medication_text(update, context)
         return
 
