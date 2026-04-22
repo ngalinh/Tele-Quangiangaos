@@ -734,13 +734,18 @@ def parse_med_reminder_request(text: str) -> Optional[dict]:
     else:
         return None
 
-    m = re.search(r'(\d+)\s*(phút|phut|tiếng|tieng|giờ|gio)', normalized)
+    m = re.search(r'(\d+)\s*(phút|phut|tiếng|tieng|giờ|gio|p|h)\b', normalized)
     if not m:
+        return None
+
+    # Avoid matching absolute times like "3h chiều", "8 giờ sáng"
+    after = normalized[m.end():].lstrip()
+    if after[:6].startswith(("chiều", "chieu", "sáng", "sang", "tối", "toi", "trưa", "trua")):
         return None
 
     num = int(m.group(1))
     unit = m.group(2)
-    delay_seconds = num * 60 if unit in ("phút", "phut") else num * 3600
+    delay_seconds = num * 60 if unit in ("phút", "phut", "p") else num * 3600
     if delay_seconds <= 0:
         return None
 
