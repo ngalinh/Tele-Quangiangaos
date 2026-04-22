@@ -86,6 +86,16 @@ ALL_THU_TYPES = [
 reminders_store: dict = {}  # {chat_id: [{"id": int, "time": datetime, "content": str, "job_name": str}]}
 reminder_counter: int = 0
 
+# --- Medication reminders ---
+MEDICATION_HISTORY_FILE = "medication_history.json"
+MEDICATION_CHAIN = {
+    "canxi": ("sắt", "sat"),
+    "sắt": ("vitamin", "vitamin"),
+    "vitamin": (None, None),
+}
+MED_CALLBACK_MAP = {"sat": "sắt", "vitamin": "vitamin"}
+MED_INTERVAL_HOURS = 2
+
 
 def get_sheet():
     """Connect to Google Sheet and return the worksheet."""
@@ -561,6 +571,149 @@ async def handle_reminder_request(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"Thưa Chủ nhân, em gặp lỗi khi đặt nhắc nhở ạ: {e}")
 
 
+def load_medication_history() -> dict:
+    """Load medication history from JSON file."""
+    try:
+        with open(MEDICATION_HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_medication_history(data: dict) -> None:
+    """Save medication history to JSON file."""
+    with open(MEDICATION_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def log_medication(user_id: int, medication: str) -> datetime:
+    """Append medication entry to history. Returns timestamp logged."""
+    history = load_medication_history()
+    key = str(user_id)
+    if key not in history:
+        history[key] = []
+    now = datetime.now(VN_TZ)
+    history[key].append({
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H:%M"),
+        "medication": medication,
+    })
+    save_medication_history(history)
+    return now
+
+
+async def send_medication_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback - remind user to take next medication with a button."""
+    job = context.job
+    next_med = job.data["next_medication"]
+    next_key = job.data["next_key"]
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"Đã uống {next_med}", callback_data=f"med_{next_key}")
+    ]])
+    await context.bot.send_message(
+        chat_id=job.chat_id,
+        text=f"💊 Thưa Chủ nhân, đã đến giờ uống {next_med} ạ!",
+        reply_markup=keyboard,
+    )
+
+
+def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, current_med: str) -> Optional[Tuple[str, datetime]]:
+    """Schedule the next medication reminder. Returns (next_med_name, reminder_time) or None if last in chain."""
+    next_med, next_key = MEDICATION_CHAIN[current_med]
+    if not next_med:
+        return None
+
+    now = datetime.now(VN_TZ)
+    reminder_time = now + timedelta(hours=MED_INTERVAL_HOURS)
+    job_name = f"med_{chat_id}_{int(now.timestamp())}"
+
+    context.job_queue.run_once(
+        send_medication_reminder,
+        when=MED_INTERVAL_HOURS * 3600,
+        data={"next_medication": next_med, "next_key": next_key},
+        name=job_name,
+        chat_id=chat_id,
+    )
+    return next_med, reminder_time
+
+
+async def handle_medication_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'đã uống canxi' text message - log it and schedule sắt reminder."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    logged_at = log_medication(user_id, "canxi")
+    scheduled = schedule_next_medication(context, chat_id, "canxi")
+
+    if scheduled:
+        next_med, reminder_time = scheduled
+        await update.message.reply_text(
+            f"Thưa Chủ nhân, em đã ghi nhận Chủ nhân uống canxi lúc {logged_at.strftime('%H:%M')} ạ.\n"
+            f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ."
+        )
+
+
+async def handle_medication_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Đã uống sắt' / 'Đã uống vitamin' button presses."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_allowed(query.from_user.id):
+        await query.edit_message_text("Thưa Chủ nhân, em không nhận ra Chủ nhân ạ.")
+        return
+
+    key = query.data.replace("med_", "")
+    medication = MED_CALLBACK_MAP.get(key)
+    if not medication:
+        return
+
+    logged_at = log_medication(query.from_user.id, medication)
+    scheduled = schedule_next_medication(context, query.message.chat_id, medication)
+
+    if scheduled:
+        next_med, reminder_time = scheduled
+        await query.edit_message_text(
+            f"Thưa Chủ nhân, em đã ghi nhận Chủ nhân uống {medication} lúc {logged_at.strftime('%H:%M')} ạ.\n"
+            f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ."
+        )
+    else:
+        await query.edit_message_text(
+            f"Thưa Chủ nhân, em đã ghi nhận Chủ nhân uống {medication} lúc {logged_at.strftime('%H:%M')} ạ.\n"
+            f"Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉"
+        )
+
+
+async def thuoc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show medication history grouped by date."""
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("Thưa Chủ nhân, em không nhận ra Chủ nhân ạ.")
+        return
+
+    history = load_medication_history()
+    items = history.get(str(update.effective_user.id), [])
+    if not items:
+        await update.message.reply_text(
+            "Thưa Chủ nhân, chưa có lịch sử uống thuốc nào ạ.\n\n"
+            "Chủ nhân xinh đẹp bắt đầu bằng cách nhắn: đã uống canxi"
+        )
+        return
+
+    by_date: dict = {}
+    for item in items:
+        by_date.setdefault(item["date"], []).append(item)
+
+    msg = "Thưa Chủ nhân, đây là lịch sử uống thuốc của Chủ nhân ạ:\n\n"
+    for d in sorted(by_date.keys(), reverse=True):
+        dt = datetime.strptime(d, "%Y-%m-%d")
+        msg += f"📅 {dt.strftime('%d/%m/%Y')}:\n"
+        for entry in by_date[d]:
+            msg += f"  • {entry['medication']}: {entry['time']}\n"
+        msg += "\n"
+
+    await update.message.reply_text(msg)
+
+
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Send user message to Claude for a conversational AI response."""
     try:
@@ -782,6 +935,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  nhắc 5 phút nữa uống nước\n"
         f"  /nhacnho - Xem danh sách nhắc nhở\n"
         f"  /xoanhac <id> - Huỷ nhắc nhở\n\n"
+        f"Nhắc uống thuốc ạ:\n"
+        f"  Nhắn: đã uống canxi - Bắt đầu chuỗi nhắc\n"
+        f"  Sau 2h em sẽ nhắc uống sắt (kèm nút)\n"
+        f"  Sau 2h nữa em sẽ nhắc uống vitamin (kèm nút)\n"
+        f"  /thuoc - Xem lịch sử uống thuốc\n\n"
         f"Trợ lý AI ạ:\n"
         f"  Chủ nhân xinh đẹp cứ nhắn bất kỳ câu hỏi nào, em sẽ trả lời ạ!\n\n"
         f"Các lệnh khác ạ:\n"
@@ -1197,7 +1355,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lower = text.lower().strip()
 
-    # 1) Reminder request
+    # 1) Medication - "đã uống canxi" starts the daily chain
+    if lower in ("đã uống canxi", "da uong canxi"):
+        await handle_medication_text(update, context)
+        return
+
+    # 2) Reminder request
     reminder_keywords = ("nhắc", "nhac", "nhớ", "nho ", "hẹn", "hen ",
                          "phút nữa", "phut nua", "tiếng nữa", "tieng nua",
                          "remind", "alarm", "báo thức", "bao thuc")
@@ -1205,7 +1368,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_reminder_request(update, context, text)
         return
 
-    # 2) Thu/chi transaction
+    # 3) Thu/chi transaction
     data = parse_message(text)
     if data is None:
         if lower.startswith("thu") or lower.startswith("chi"):
@@ -1215,7 +1378,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "  thu 5tr lương"
             )
             return
-        # 3) AI assistant fallback
+        # 4) AI assistant fallback
         await handle_ai_chat(update, context, text)
         return
 
@@ -1363,6 +1526,7 @@ def main():
     app.add_handler(CommandHandler("xoa", xoa_command))
     app.add_handler(CommandHandler("nhacnho", nhacnho_command))
     app.add_handler(CommandHandler("xoanhac", xoanhac_command))
+    app.add_handler(CommandHandler("thuoc", thuoc_command))
 
     # Photo handler for OCR
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
@@ -1371,6 +1535,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_delete_callback, pattern=r"^(del_|confirm_del_|cancel_del)"))
     app.add_handler(CallbackQueryHandler(handle_edit_callback, pattern=r"^(edit_|editcat_)"))
     app.add_handler(CallbackQueryHandler(handle_ocr_callback, pattern=r"^ocr_"))
+    app.add_handler(CallbackQueryHandler(handle_medication_callback, pattern=r"^med_"))
 
     # Text message handler
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

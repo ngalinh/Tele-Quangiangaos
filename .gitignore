@@ -2,6 +2,9 @@
 .env
 credentials.json
 
+# Runtime data
+medication_history.json
+
 # Python
 __pycache__/
 *.py[cod]
