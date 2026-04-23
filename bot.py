@@ -98,6 +98,7 @@ MEDICATION_CHAIN = {
 MED_CALLBACK_MAP = {"sat": "sắt", "vitamin": "vitamin"}
 MED_INTERVAL_HOURS = 2
 MED_DELETE_WINDOW_SECONDS = 120  # 2 minutes to delete after saving
+POST_IRON_EAT_REMINDER_MINUTES = 30  # remind to eat 30 min after taking iron
 
 # Pending confirmations waiting for Lưu lại / Huỷ (in-memory)
 pending_med_confirmations: dict = {}  # {token: {"medication", "chat_id", "user_id"}}
@@ -592,7 +593,12 @@ def save_medication_history(data: dict) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def log_medication(user_id: int, medication: str, next_job_name: Optional[str] = None) -> dict:
+def log_medication(
+    user_id: int,
+    medication: str,
+    next_job_name: Optional[str] = None,
+    eat_job_name: Optional[str] = None,
+) -> dict:
     """Append medication entry to history. Returns the stored entry."""
     history = load_medication_history()
     key = str(user_id)
@@ -606,6 +612,7 @@ def log_medication(user_id: int, medication: str, next_job_name: Optional[str] =
         "time": now.strftime("%H:%M"),
         "medication": medication,
         "next_job_name": next_job_name,
+        "eat_job_name": eat_job_name,
     }
     history[key].append(entry)
     save_medication_history(history)
@@ -666,6 +673,32 @@ def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, c
         chat_id=chat_id,
     )
     return next_med, reminder_time, job_name
+
+
+async def send_eat_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback - remind user to eat 30 min after taking iron."""
+    job = context.job
+    await context.bot.send_message(
+        chat_id=job.chat_id,
+        text=(
+            f"🍚 Thưa Chủ nhân, đã {POST_IRON_EAT_REMINDER_MINUTES} phút kể từ khi uống sắt rồi ạ. "
+            f"Chủ nhân đi ăn thôi!"
+        ),
+    )
+
+
+def schedule_post_iron_eat_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Tuple[datetime, str]:
+    """Schedule an eat reminder 30 min after iron. Returns (reminder_time, job_name)."""
+    now = datetime.now(VN_TZ)
+    reminder_time = now + timedelta(minutes=POST_IRON_EAT_REMINDER_MINUTES)
+    job_name = f"eatreminder_{chat_id}_{uuid.uuid4().hex[:8]}"
+    context.job_queue.run_once(
+        send_eat_reminder,
+        when=POST_IRON_EAT_REMINDER_MINUTES * 60,
+        name=job_name,
+        chat_id=chat_id,
+    )
+    return reminder_time, job_name
 
 
 async def remove_delete_button(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -797,23 +830,36 @@ async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     scheduled = schedule_next_medication(context, chat_id, medication)
     next_job_name = scheduled[2] if scheduled else None
-    entry = log_medication(user_id, medication, next_job_name=next_job_name)
 
+    eat_job_name = None
+    eat_reminder_time = None
+    if medication == "sắt":
+        eat_reminder_time, eat_job_name = schedule_post_iron_eat_reminder(context, chat_id)
+
+    entry = log_medication(
+        user_id, medication, next_job_name=next_job_name, eat_job_name=eat_job_name
+    )
+
+    logged_date = datetime.fromisoformat(entry['timestamp']).strftime('%d/%m/%Y')
+    lines = [
+        f"Thưa Chủ nhân, em đã lưu lịch sử ạ:",
+        "",
+        f"  💊 Uống {medication} lúc {entry['time']} ngày {logged_date}",
+        "",
+    ]
     if scheduled:
         next_med, reminder_time, _ = scheduled
-        text = (
-            f"Thưa Chủ nhân, em đã lưu lịch sử ạ:\n\n"
-            f"  💊 Uống {medication} lúc {entry['time']} ngày {datetime.fromisoformat(entry['timestamp']).strftime('%d/%m/%Y')}\n\n"
-            f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ.\n\n"
-            f"(Chủ nhân có thể xoá lịch sử này trong 2 phút)"
-        )
+        lines.append(f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ.")
     else:
-        text = (
-            f"Thưa Chủ nhân, em đã lưu lịch sử ạ:\n\n"
-            f"  💊 Uống {medication} lúc {entry['time']} ngày {datetime.fromisoformat(entry['timestamp']).strftime('%d/%m/%Y')}\n\n"
-            f"Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉\n\n"
-            f"(Chủ nhân có thể xoá lịch sử này trong 2 phút)"
+        lines.append("Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉")
+    if eat_reminder_time is not None:
+        lines.append(
+            f"Em cũng sẽ nhắc Chủ nhân đi ăn lúc {eat_reminder_time.strftime('%H:%M')} "
+            f"(sau {POST_IRON_EAT_REMINDER_MINUTES} phút) ạ."
         )
+    lines.append("")
+    lines.append("(Chủ nhân có thể xoá lịch sử này trong 2 phút)")
+    text = "\n".join(lines)
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Xoá", callback_data=f"meddel_{entry['id']}")
@@ -859,6 +905,11 @@ async def _medication_delete(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         for job in context.job_queue.get_jobs_by_name(next_job_name):
             job.schedule_removal()
 
+    eat_job_name = entry.get("eat_job_name")
+    if eat_job_name:
+        for job in context.job_queue.get_jobs_by_name(eat_job_name):
+            job.schedule_removal()
+
     delete_medication_entry(query.from_user.id, entry_id)
 
     cancelled_note = ""
@@ -866,6 +917,8 @@ async def _medication_delete(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         next_med, _ = MEDICATION_CHAIN.get(entry["medication"], (None, None))
         if next_med:
             cancelled_note = f"\nEm cũng đã huỷ nhắc nhở uống {next_med} ạ."
+    if eat_job_name:
+        cancelled_note += "\nEm cũng đã huỷ nhắc nhở đi ăn ạ."
 
     await query.edit_message_text(
         f"Thưa Chủ nhân, em đã xoá lịch sử uống {entry['medication']} lúc {entry['time']} ạ.{cancelled_note}"
