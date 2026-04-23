@@ -4,6 +4,10 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+## Git workflow (owner's preference)
+
+Commit and push directly to `main`. Do not create feature branches, and do not open pull requests unless the owner explicitly asks. If the harness assigns a feature branch for the session, merge it into `main` (fast-forward when possible) and push `main` before ending the session.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
