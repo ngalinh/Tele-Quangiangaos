@@ -91,15 +91,17 @@ reminder_counter: int = 0
 
 # --- Medication reminders ---
 MEDICATION_HISTORY_FILE = "medication_history.json"
+# medication -> (next_med_display, next_callback_key, delay_seconds) or None to end the chain
 MEDICATION_CHAIN = {
-    "canxi": ("sắt", "sat"),
-    "sắt": ("vitamin", "vitamin"),
-    "vitamin": (None, None),
+    "Gaviscon": ("canxi", "canxi", 2 * 3600),
+    "canxi": ("sắt", "sat", 2 * 3600),
+    "sắt": None,  # handled by post-iron eat reminder, which then schedules vitamin
+    "vitamin": None,
 }
-MED_CALLBACK_MAP = {"sat": "sắt", "vitamin": "vitamin"}
-MED_INTERVAL_HOURS = 2
+MED_CALLBACK_MAP = {"canxi": "canxi", "sat": "sắt", "vitamin": "vitamin"}
 MED_DELETE_WINDOW_SECONDS = 120  # 2 minutes to delete after saving
 POST_IRON_EAT_REMINDER_MINUTES = 30  # remind to eat 30 min after taking iron
+POST_EAT_VITAMIN_REMINDER_MINUTES = 30  # remind to take vitamin 30 min after the eat reminder
 
 # Pending confirmations waiting for Lưu lại / Huỷ (in-memory)
 pending_med_confirmations: dict = {}  # {token: {"medication", "chat_id", "user_id"}}
@@ -659,17 +661,18 @@ async def send_medication_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, current_med: str) -> Optional[Tuple[str, datetime, str]]:
     """Schedule next medication reminder. Returns (next_med, reminder_time, job_name) or None."""
-    next_med, next_key = MEDICATION_CHAIN[current_med]
-    if not next_med:
+    chain = MEDICATION_CHAIN.get(current_med)
+    if not chain:
         return None
+    next_med, next_key, delay_seconds = chain
 
     now = datetime.now(VN_TZ)
-    reminder_time = now + timedelta(hours=MED_INTERVAL_HOURS)
+    reminder_time = now + timedelta(seconds=delay_seconds)
     job_name = f"medreminder_{chat_id}_{uuid.uuid4().hex[:8]}"
 
     context.job_queue.run_once(
         send_medication_reminder,
-        when=MED_INTERVAL_HOURS * 3600,
+        when=delay_seconds,
         data={"next_medication": next_med, "next_key": next_key},
         name=job_name,
         chat_id=chat_id,
@@ -678,14 +681,25 @@ def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, c
 
 
 async def send_eat_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """JobQueue callback - remind user to eat 30 min after taking iron."""
+    """JobQueue callback - remind user to eat 30 min after taking iron, then schedule vitamin."""
     job = context.job
+    chat_id = job.chat_id
     await context.bot.send_message(
-        chat_id=job.chat_id,
+        chat_id=chat_id,
         text=(
             f"🍚 Thưa Chủ nhân, đã {POST_IRON_EAT_REMINDER_MINUTES} phút kể từ khi uống sắt rồi ạ. "
             f"Chủ nhân đi ăn thôi!"
         ),
+    )
+
+    # Chain: 30 minutes after the eat reminder, remind to take vitamin.
+    vitamin_job_name = f"medreminder_{chat_id}_{uuid.uuid4().hex[:8]}"
+    context.job_queue.run_once(
+        send_medication_reminder,
+        when=POST_EAT_VITAMIN_REMINDER_MINUTES * 60,
+        data={"next_medication": "vitamin", "next_key": "vitamin"},
+        name=vitamin_job_name,
+        chat_id=chat_id,
     )
 
 
@@ -750,9 +764,23 @@ async def show_medication_confirmation(target, context: ContextTypes.DEFAULT_TYP
         await target.reply_text(text, reply_markup=keyboard)
 
 
-async def handle_medication_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 'đã uống canxi' text - show Lưu/Huỷ confirmation."""
-    await show_medication_confirmation(update.message, context, "canxi", is_query=False)
+def parse_medication_taken_text(text: str) -> Optional[str]:
+    """Detect 'đã uống <med>' / 'da uong <med>' for tracked medications.
+
+    Returns the medication display name, or None if no match.
+    """
+    normalized = unicodedata.normalize("NFC", text.lower())
+    if "đã uống" not in normalized and "da uong" not in normalized:
+        return None
+    if re.search(r'\bgaviscon\b', normalized):
+        return "Gaviscon"
+    if re.search(r'\bcanxi\b', normalized):
+        return "canxi"
+    if re.search(r'\bsắt\b', normalized) or re.search(r'\bsat\b', normalized):
+        return "sắt"
+    if re.search(r'\bvitamin\b', normalized):
+        return "vitamin"
+    return None
 
 
 def parse_med_reminder_request(text: str) -> Optional[dict]:
@@ -830,13 +858,29 @@ async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = pending["chat_id"]
     user_id = pending["user_id"]
 
-    scheduled = schedule_next_medication(context, chat_id, medication)
-    next_job_name = scheduled[2] if scheduled else None
-
+    next_job_name = None
     eat_job_name = None
-    eat_reminder_time = None
+    next_lines = []
+
     if medication == "sắt":
         eat_reminder_time, eat_job_name = schedule_post_iron_eat_reminder(context, chat_id)
+        vitamin_time = eat_reminder_time + timedelta(minutes=POST_EAT_VITAMIN_REMINDER_MINUTES)
+        next_lines.append(
+            f"Em sẽ nhắc Chủ nhân đi ăn lúc {eat_reminder_time.strftime('%H:%M')} "
+            f"(sau {POST_IRON_EAT_REMINDER_MINUTES} phút) ạ."
+        )
+        next_lines.append(
+            f"Sau đó em sẽ nhắc uống vitamin lúc {vitamin_time.strftime('%H:%M')} ạ."
+        )
+    else:
+        scheduled = schedule_next_medication(context, chat_id, medication)
+        if scheduled:
+            next_med, reminder_time, next_job_name = scheduled
+            next_lines.append(
+                f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ."
+            )
+        else:
+            next_lines.append("Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉")
 
     entry = log_medication(
         user_id, medication, next_job_name=next_job_name, eat_job_name=eat_job_name
@@ -849,16 +893,7 @@ async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"  💊 Uống {medication} lúc {entry['time']} ngày {logged_date}",
         "",
     ]
-    if scheduled:
-        next_med, reminder_time, _ = scheduled
-        lines.append(f"Em sẽ nhắc Chủ nhân uống {next_med} lúc {reminder_time.strftime('%H:%M')} ạ.")
-    else:
-        lines.append("Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉")
-    if eat_reminder_time is not None:
-        lines.append(
-            f"Em cũng sẽ nhắc Chủ nhân đi ăn lúc {eat_reminder_time.strftime('%H:%M')} "
-            f"(sau {POST_IRON_EAT_REMINDER_MINUTES} phút) ạ."
-        )
+    lines.extend(next_lines)
     lines.append("")
     lines.append("(Chủ nhân có thể xoá lịch sử này trong 2 phút)")
     text = "\n".join(lines)
@@ -916,7 +951,8 @@ async def _medication_delete(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     cancelled_note = ""
     if next_job_name:
-        next_med, _ = MEDICATION_CHAIN.get(entry["medication"], (None, None))
+        chain = MEDICATION_CHAIN.get(entry["medication"])
+        next_med = chain[0] if chain else None
         if next_med:
             cancelled_note = f"\nEm cũng đã huỷ nhắc nhở uống {next_med} ạ."
     if eat_job_name:
@@ -967,7 +1003,7 @@ async def thuoc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not items:
         await update.message.reply_text(
             "Thưa Chủ nhân, chưa có lịch sử uống thuốc nào ạ.\n\n"
-            "Chủ nhân xinh đẹp bắt đầu bằng cách nhắn: đã uống canxi"
+            "Chủ nhân xinh đẹp bắt đầu bằng cách nhắn: đã uống Gaviscon"
         )
         return
 
@@ -1210,9 +1246,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  /nhacnho - Xem danh sách nhắc nhở\n"
         f"  /xoanhac <id> - Huỷ nhắc nhở\n\n"
         f"Nhắc uống thuốc ạ:\n"
-        f"  Nhắn: đã uống canxi - Bắt đầu chuỗi nhắc\n"
-        f"  Sau 2h em sẽ nhắc uống sắt (kèm nút)\n"
-        f"  Sau 2h nữa em sẽ nhắc uống vitamin (kèm nút)\n"
+        f"  Nhắn: đã uống Gaviscon - Bắt đầu chuỗi nhắc\n"
+        f"  Sau 2h em sẽ nhắc uống canxi (kèm nút)\n"
+        f"  Sau 2h nữa em sẽ nhắc uống sắt (kèm nút)\n"
+        f"  Sau 30 phút em sẽ nhắc đi ăn\n"
+        f"  Sau 30 phút nữa em sẽ nhắc uống vitamin (kèm nút)\n"
+        f"  Nếu lỡ huỷ confirm, Chủ nhân nhắn lại 'đã uống canxi/sắt/vitamin' để lưu ạ.\n"
         f"  Nhắc thủ công: nhắc uống sắt 30 phút nữa\n"
         f"                 nhắc uống vitamin 1 tiếng nữa\n"
         f"  /thuoc - Xem lịch sử uống thuốc\n\n"
@@ -1627,10 +1666,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower = text.lower().strip()
     normalized = unicodedata.normalize("NFC", lower)
 
-    # 1) Medication taken - "đã uống canxi" starts the daily chain
-    if "đã uống canxi" in normalized or "da uong canxi" in normalized:
-        logger.info(f"Medication trigger: canxi from user {update.effective_user.id}")
-        await handle_medication_text(update, context)
+    # 1) Medication taken - "đã uống <med>" opens the same Lưu/Huỷ confirmation as the button.
+    med_taken = parse_medication_taken_text(text)
+    if med_taken:
+        logger.info(f"Medication trigger: {med_taken} from user {update.effective_user.id}")
+        await show_medication_confirmation(update.message, context, med_taken, is_query=False)
         return
 
     # 2) Manual medication reminder - "nhắc uống sắt/vitamin X phút/tiếng nữa"
