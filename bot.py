@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import json
@@ -446,11 +447,12 @@ def guess_category_from_history(description: str, is_income: bool) -> Optional[s
     return best_match
 
 
-def parse_reminder_with_claude(text: str) -> Optional[dict]:
+async def parse_reminder_with_claude(text: str) -> Optional[dict]:
     """Use Claude to parse a Vietnamese reminder request into structured data."""
     try:
         now = datetime.now(VN_TZ)
-        message = claude_client.messages.create(
+        message = await asyncio.to_thread(
+            claude_client.messages.create,
             model="claude-sonnet-4-20250514",
             max_tokens=256,
             system=(
@@ -508,7 +510,7 @@ async def handle_reminder_request(update: Update, context: ContextTypes.DEFAULT_
 
     await update.message.reply_text("Thưa Chủ nhân, em đang xử lý nhắc nhở ạ...")
 
-    parsed = parse_reminder_with_claude(text)
+    parsed = await parse_reminder_with_claude(text)
     if not parsed or "hour" not in parsed or "content" not in parsed:
         await update.message.reply_text(
             "Thưa Chủ nhân, em không hiểu thời gian nhắc nhở ạ.\n"
@@ -987,7 +989,8 @@ async def thuoc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     """Send user message to Claude for a conversational AI response."""
     try:
-        message = claude_client.messages.create(
+        message = await asyncio.to_thread(
+            claude_client.messages.create,
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             system=(
@@ -1009,13 +1012,14 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
         )
 
 
-def extract_from_screenshot(image_bytes: bytes) -> Optional[dict]:
+async def extract_from_screenshot(image_bytes: bytes) -> Optional[dict]:
     """Use Claude Vision to extract transfer info from a bank screenshot."""
     try:
         import base64
         image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
-        message = claude_client.messages.create(
+        message = await asyncio.to_thread(
+            claude_client.messages.create,
             model="claude-sonnet-4-20250514",
             max_tokens=1024,
             messages=[
@@ -1267,8 +1271,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        worksheet = get_sheet()
-        all_values = worksheet.get_all_values()
+        all_values = await asyncio.to_thread(lambda: get_sheet().get_all_values())
         current_month = datetime.now(VN_TZ).month
 
         total_thu = 0
@@ -1319,8 +1322,7 @@ async def xoa_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        worksheet = get_sheet()
-        all_values = worksheet.get_all_values()
+        all_values = await asyncio.to_thread(lambda: get_sheet().get_all_values())
         current_month = datetime.now(VN_TZ).month
 
         # Collect data rows for current month (with row numbers)
@@ -1393,8 +1395,7 @@ async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
         row_num = int(data.split("_")[1])
 
         # Show confirmation
-        worksheet = get_sheet()
-        row_data = get_row_data(worksheet, row_num)
+        row_data = await asyncio.to_thread(lambda: get_row_data(get_sheet(), row_num))
         if not row_data:
             await query.edit_message_text("Thưa Chủ nhân, em không tìm thấy dòng này ạ. Có thể đã bị xoá rồi ạ.")
             return
@@ -1427,7 +1428,7 @@ async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
     elif data.startswith("confirm_del_"):
         row_num = int(data.split("_")[2])
         try:
-            result = delete_from_sheet(row_num)
+            result = await asyncio.to_thread(delete_from_sheet, row_num)
             await query.edit_message_text(result)
         except Exception as e:
             logger.error(f"Error deleting row: {e}")
@@ -1456,7 +1457,7 @@ async def handle_ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         try:
-            msg, row_num = add_to_sheet(ocr_data)
+            msg, row_num = await asyncio.to_thread(add_to_sheet, ocr_data)
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("Sửa", callback_data=f"edit_{row_num}"),
@@ -1494,8 +1495,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         cat_idx = int(parts[2])
 
         # Determine if THU or CHI from current row
-        worksheet = get_sheet()
-        row_data = get_row_data(worksheet, row_num)
+        row_data = await asyncio.to_thread(lambda: get_row_data(get_sheet(), row_num))
         if not row_data:
             await query.edit_message_text("Thưa Chủ nhân, em không tìm thấy dòng này ạ.")
             return
@@ -1507,7 +1507,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
         new_category = cat_list[cat_idx]
-        msg = update_category_in_sheet(row_num, new_category)
+        msg = await asyncio.to_thread(update_category_in_sheet, row_num, new_category)
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("Sửa", callback_data=f"edit_{row_num}"),
@@ -1520,8 +1520,7 @@ async def handle_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         row_num = int(data.replace("edit_", ""))
 
         # Read current row to determine THU/CHI
-        worksheet = get_sheet()
-        row_data = get_row_data(worksheet, row_num)
+        row_data = await asyncio.to_thread(lambda: get_row_data(get_sheet(), row_num))
         if not row_data:
             await query.edit_message_text("Thưa Chủ nhân, em không tìm thấy dòng này ạ.")
             return
@@ -1649,7 +1648,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 4) Thu/chi transaction
-    data = parse_message(text)
+    data = await asyncio.to_thread(parse_message, text)
     if data is None:
         if lower.startswith("thu") or lower.startswith("chi"):
             await update.message.reply_text(
@@ -1663,7 +1662,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        msg, row_num = add_to_sheet(data)
+        msg, row_num = await asyncio.to_thread(add_to_sheet, data)
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("Sửa", callback_data=f"edit_{row_num}"),
@@ -1695,7 +1694,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_bytes = bio.getvalue()
 
         # Extract info using Claude Vision
-        extracted = extract_from_screenshot(image_bytes)
+        extracted = await extract_from_screenshot(image_bytes)
 
         if not extracted:
             await update.message.reply_text(
@@ -1730,7 +1729,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             description = desc_clean if desc_clean else raw_description
 
         # Use history lookup, then simple rules
-        category = guess_category_from_history(description, is_income=False)
+        category = await asyncio.to_thread(guess_category_from_history, description, False)
         if category is None:
             desc_lower = description.lower()
             if any(w in desc_lower for w in ("ăn", "uống", "an ", "uong")):
@@ -1798,7 +1797,7 @@ def main():
         print("ERROR: Chưa cấu hình TELEGRAM_BOT_TOKEN trong file .env")
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
