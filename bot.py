@@ -600,6 +600,7 @@ def save_medication_history(data: dict) -> None:
 def log_medication(
     user_id: int,
     medication: str,
+    taken_at: Optional[datetime] = None,
     next_job_name: Optional[str] = None,
     eat_job_name: Optional[str] = None,
 ) -> dict:
@@ -608,12 +609,13 @@ def log_medication(
     key = str(user_id)
     if key not in history:
         history[key] = []
-    now = datetime.now(VN_TZ)
+    if taken_at is None:
+        taken_at = datetime.now(VN_TZ)
     entry = {
         "id": uuid.uuid4().hex[:10],
-        "timestamp": now.isoformat(),
-        "date": now.strftime("%Y-%m-%d"),
-        "time": now.strftime("%H:%M"),
+        "timestamp": taken_at.isoformat(),
+        "date": taken_at.strftime("%Y-%m-%d"),
+        "time": taken_at.strftime("%H:%M"),
         "medication": medication,
         "next_job_name": next_job_name,
         "eat_job_name": eat_job_name,
@@ -659,20 +661,29 @@ async def send_medication_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def schedule_next_medication(context: ContextTypes.DEFAULT_TYPE, chat_id: int, current_med: str) -> Optional[Tuple[str, datetime, str]]:
-    """Schedule next medication reminder. Returns (next_med, reminder_time, job_name) or None."""
+def schedule_next_medication(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    current_med: str,
+    taken_at: datetime,
+) -> Optional[Tuple[str, datetime, str]]:
+    """Schedule next medication reminder anchored at taken_at + chain delay.
+
+    Returns (next_med, reminder_time, job_name) or None.
+    """
     chain = MEDICATION_CHAIN.get(current_med)
     if not chain:
         return None
     next_med, next_key, delay_seconds = chain
 
     now = datetime.now(VN_TZ)
-    reminder_time = now + timedelta(seconds=delay_seconds)
+    reminder_time = taken_at + timedelta(seconds=delay_seconds)
+    actual_delay = max(1.0, (reminder_time - now).total_seconds())
     job_name = f"medreminder_{chat_id}_{uuid.uuid4().hex[:8]}"
 
     context.job_queue.run_once(
         send_medication_reminder,
-        when=delay_seconds,
+        when=actual_delay,
         data={"next_medication": next_med, "next_key": next_key},
         name=job_name,
         chat_id=chat_id,
@@ -703,14 +714,19 @@ async def send_eat_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-def schedule_post_iron_eat_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Tuple[datetime, str]:
+def schedule_post_iron_eat_reminder(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    taken_at: datetime,
+) -> Tuple[datetime, str]:
     """Schedule an eat reminder 30 min after iron. Returns (reminder_time, job_name)."""
     now = datetime.now(VN_TZ)
-    reminder_time = now + timedelta(minutes=POST_IRON_EAT_REMINDER_MINUTES)
+    reminder_time = taken_at + timedelta(minutes=POST_IRON_EAT_REMINDER_MINUTES)
+    actual_delay = max(1.0, (reminder_time - now).total_seconds())
     job_name = f"eatreminder_{chat_id}_{uuid.uuid4().hex[:8]}"
     context.job_queue.run_once(
         send_eat_reminder,
-        when=POST_IRON_EAT_REMINDER_MINUTES * 60,
+        when=actual_delay,
         name=job_name,
         chat_id=chat_id,
     )
@@ -730,8 +746,18 @@ async def remove_delete_button(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info(f"remove_delete_button skipped: {e}")
 
 
-async def show_medication_confirmation(target, context: ContextTypes.DEFAULT_TYPE, medication: str, is_query: bool) -> None:
-    """Show 'Lưu lại / Huỷ' confirmation for a medication."""
+async def show_medication_confirmation(
+    target,
+    context: ContextTypes.DEFAULT_TYPE,
+    medication: str,
+    is_query: bool,
+    taken_at: Optional[datetime] = None,
+) -> None:
+    """Show 'Lưu lại / Huỷ' confirmation for a medication.
+
+    `taken_at` defaults to now; pass an earlier datetime when the user
+    reports the time they took the med (e.g. "đã uống Gaviscon lúc 12:19").
+    """
     token = uuid.uuid4().hex[:10]
     if is_query:
         chat_id = target.message.chat_id
@@ -740,17 +766,20 @@ async def show_medication_confirmation(target, context: ContextTypes.DEFAULT_TYP
         chat_id = target.chat_id
         user_id = target.from_user.id
 
+    if taken_at is None:
+        taken_at = datetime.now(VN_TZ)
+
     pending_med_confirmations[token] = {
         "medication": medication,
         "chat_id": chat_id,
         "user_id": user_id,
+        "taken_at": taken_at,
     }
 
-    now = datetime.now(VN_TZ)
     text = (
         f"Thưa Chủ nhân, em xin xác nhận ạ:\n\n"
         f"  💊 Uống {medication}\n"
-        f"  Thời gian: {now.strftime('%H:%M %d/%m/%Y')}\n\n"
+        f"  Thời gian: {taken_at.strftime('%H:%M %d/%m/%Y')}\n\n"
         f"Chủ nhân có muốn em lưu vào lịch sử không ạ?"
     )
     keyboard = InlineKeyboardMarkup([[
@@ -764,23 +793,54 @@ async def show_medication_confirmation(target, context: ContextTypes.DEFAULT_TYP
         await target.reply_text(text, reply_markup=keyboard)
 
 
-def parse_medication_taken_text(text: str) -> Optional[str]:
-    """Detect 'đã uống <med>' / 'da uong <med>' for tracked medications.
+def extract_time_from_text(text: str) -> Optional[Tuple[int, int]]:
+    """Extract a 24-hour clock time from free text.
 
-    Returns the medication display name, or None if no match.
+    Recognises 12:19, 12h19, 12g19, 12 giờ 19, 12h, 12g, 12 giờ, 12:00.
+    Returns (hour, minute) or None.
+    """
+    patterns_hm = [
+        r'(?<!\d)(\d{1,2})\s*[:hg]\s*(\d{2})(?!\d)',
+        r'(?<!\d)(\d{1,2})\s*(?:giờ|gio)\s*(\d{1,2})(?!\d)',
+    ]
+    for pat in patterns_hm:
+        m = re.search(pat, text)
+        if m:
+            h, mn = int(m.group(1)), int(m.group(2))
+            if 0 <= h < 24 and 0 <= mn < 60:
+                return h, mn
+    patterns_h = [
+        r'(?<!\d)(\d{1,2})\s*[hg](?!\d|[a-zA-ZÀ-ỹ])',
+        r'(?<!\d)(\d{1,2})\s*(?:giờ|gio)\b',
+    ]
+    for pat in patterns_h:
+        m = re.search(pat, text)
+        if m:
+            h = int(m.group(1))
+            if 0 <= h < 24:
+                return h, 0
+    return None
+
+
+def parse_medication_taken_text(text: str) -> Optional[dict]:
+    """Detect 'đã uống <med>' / 'da uong <med>' with optional clock time.
+
+    Returns {"medication": str, "time": Optional[(h, m)]} or None.
     """
     normalized = unicodedata.normalize("NFC", text.lower())
     if "đã uống" not in normalized and "da uong" not in normalized:
         return None
     if re.search(r'\bgaviscon\b', normalized):
-        return "Gaviscon"
-    if re.search(r'\bcanxi\b', normalized):
-        return "canxi"
-    if re.search(r'\bsắt\b', normalized) or re.search(r'\bsat\b', normalized):
-        return "sắt"
-    if re.search(r'\bvitamin\b', normalized):
-        return "vitamin"
-    return None
+        medication = "Gaviscon"
+    elif re.search(r'\bcanxi\b', normalized):
+        medication = "canxi"
+    elif re.search(r'\bsắt\b', normalized) or re.search(r'\bsat\b', normalized):
+        medication = "sắt"
+    elif re.search(r'\bvitamin\b', normalized):
+        medication = "vitamin"
+    else:
+        return None
+    return {"medication": medication, "time": extract_time_from_text(normalized)}
 
 
 def parse_med_reminder_request(text: str) -> Optional[dict]:
@@ -857,13 +917,14 @@ async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     medication = pending["medication"]
     chat_id = pending["chat_id"]
     user_id = pending["user_id"]
+    taken_at = pending.get("taken_at") or datetime.now(VN_TZ)
 
     next_job_name = None
     eat_job_name = None
     next_lines = []
 
     if medication == "sắt":
-        eat_reminder_time, eat_job_name = schedule_post_iron_eat_reminder(context, chat_id)
+        eat_reminder_time, eat_job_name = schedule_post_iron_eat_reminder(context, chat_id, taken_at)
         vitamin_time = eat_reminder_time + timedelta(minutes=POST_EAT_VITAMIN_REMINDER_MINUTES)
         next_lines.append(
             f"Em sẽ nhắc Chủ nhân đi ăn lúc {eat_reminder_time.strftime('%H:%M')} "
@@ -873,7 +934,7 @@ async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Sau đó em sẽ nhắc uống vitamin lúc {vitamin_time.strftime('%H:%M')} ạ."
         )
     else:
-        scheduled = schedule_next_medication(context, chat_id, medication)
+        scheduled = schedule_next_medication(context, chat_id, medication, taken_at)
         if scheduled:
             next_med, reminder_time, next_job_name = scheduled
             next_lines.append(
@@ -883,7 +944,8 @@ async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
             next_lines.append("Chủ nhân đã hoàn thành lịch uống thuốc hôm nay ạ! 🎉")
 
     entry = log_medication(
-        user_id, medication, next_job_name=next_job_name, eat_job_name=eat_job_name
+        user_id, medication, taken_at=taken_at,
+        next_job_name=next_job_name, eat_job_name=eat_job_name,
     )
 
     logged_date = datetime.fromisoformat(entry['timestamp']).strftime('%d/%m/%Y')
@@ -1669,8 +1731,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1) Medication taken - "đã uống <med>" opens the same Lưu/Huỷ confirmation as the button.
     med_taken = parse_medication_taken_text(text)
     if med_taken:
-        logger.info(f"Medication trigger: {med_taken} from user {update.effective_user.id}")
-        await show_medication_confirmation(update.message, context, med_taken, is_query=False)
+        taken_at = None
+        if med_taken["time"]:
+            h, m = med_taken["time"]
+            now = datetime.now(VN_TZ)
+            taken_at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            # If parsed time is in the future (e.g. user wrote 23:00 but it's now 01:00), assume yesterday.
+            if taken_at > now:
+                taken_at -= timedelta(days=1)
+        logger.info(
+            f"Medication trigger: {med_taken['medication']} taken_at={taken_at} "
+            f"from user {update.effective_user.id}"
+        )
+        await show_medication_confirmation(
+            update.message, context, med_taken["medication"], is_query=False, taken_at=taken_at
+        )
         return
 
     # 2) Manual medication reminder - "nhắc uống sắt/vitamin X phút/tiếng nữa"
