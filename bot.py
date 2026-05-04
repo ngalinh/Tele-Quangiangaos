@@ -15,7 +15,7 @@ from io import BytesIO
 import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
-import anthropic
+import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -41,15 +41,17 @@ GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 ALLOWED_USER_IDS = os.getenv("ALLOWED_USER_IDS", "")
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 ALLOWED_USERS = set()
 if ALLOWED_USER_IDS:
     ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USER_IDS.split(",") if uid.strip()}
 
-# Initialize Anthropic client for Claude Vision OCR
-claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-logger.info("Anthropic Claude Vision client ready.")
+# Initialize Gemini client for parsing, chat, and Vision OCR
+genai.configure(api_key=GEMINI_API_KEY)
+gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+logger.info(f"Gemini client ready (model={GEMINI_MODEL}).")
 
 # --- Categories ---
 EXPENSE_CATEGORIES = {
@@ -449,31 +451,30 @@ def guess_category_from_history(description: str, is_income: bool) -> Optional[s
     return best_match
 
 
-async def parse_reminder_with_claude(text: str) -> Optional[dict]:
-    """Use Claude to parse a Vietnamese reminder request into structured data."""
+async def parse_reminder_with_gemini(text: str) -> Optional[dict]:
+    """Use Gemini to parse a Vietnamese reminder request into structured data."""
     try:
         now = datetime.now(VN_TZ)
-        message = await asyncio.to_thread(
-            claude_client.messages.create,
-            model="claude-sonnet-4-20250514",
-            max_tokens=256,
-            system=(
-                "Bạn là parser nhắc nhở. Trích xuất thời gian và nội dung từ tin nhắn tiếng Việt.\n"
-                f"Thời gian hiện tại: {now.strftime('%Y-%m-%d %H:%M')} (ngày {now.strftime('%d/%m/%Y')}, "
-                f"{'thứ ' + str(now.isoweekday())} trong tuần).\n"
-                "Trả về JSON duy nhất: {\"hour\": <0-23>, \"minute\": <0-59>, \"date\": \"YYYY-MM-DD\", \"content\": \"<nội dung nhắc>\"}\n"
-                "Quy tắc:\n"
-                "- 'chiều' = +12h (3h chiều = 15:00)\n"
-                "- 'tối' = buổi tối (8h tối = 20:00)\n"
-                "- 'sáng mai' = ngày mai buổi sáng\n"
-                "- 'X phút nữa' hoặc 'X tiếng nữa' = tính từ thời gian hiện tại\n"
-                "- Nếu không nói ngày, mặc định là hôm nay. Nếu giờ đã qua thì là ngày mai.\n"
-                "- content là phần nội dung cần nhắc (bỏ phần 'nhắc tôi', 'nhắc', thời gian)\n"
-                "Chỉ trả về JSON, không giải thích."
-            ),
-            messages=[{"role": "user", "content": text}],
+        system_prompt = (
+            "Bạn là parser nhắc nhở. Trích xuất thời gian và nội dung từ tin nhắn tiếng Việt.\n"
+            f"Thời gian hiện tại: {now.strftime('%Y-%m-%d %H:%M')} (ngày {now.strftime('%d/%m/%Y')}, "
+            f"{'thứ ' + str(now.isoweekday())} trong tuần).\n"
+            "Trả về JSON duy nhất: {\"hour\": <0-23>, \"minute\": <0-59>, \"date\": \"YYYY-MM-DD\", \"content\": \"<nội dung nhắc>\"}\n"
+            "Quy tắc:\n"
+            "- 'chiều' = +12h (3h chiều = 15:00)\n"
+            "- 'tối' = buổi tối (8h tối = 20:00)\n"
+            "- 'sáng mai' = ngày mai buổi sáng\n"
+            "- 'X phút nữa' hoặc 'X tiếng nữa' = tính từ thời gian hiện tại\n"
+            "- Nếu không nói ngày, mặc định là hôm nay. Nếu giờ đã qua thì là ngày mai.\n"
+            "- content là phần nội dung cần nhắc (bỏ phần 'nhắc tôi', 'nhắc', thời gian)\n"
+            "Chỉ trả về JSON, không giải thích."
         )
-        response_text = message.content[0].text.strip()
+        response = await asyncio.to_thread(
+            gemini_model.generate_content,
+            [system_prompt, text],
+            generation_config={"max_output_tokens": 256, "temperature": 0.0},
+        )
+        response_text = response.text.strip()
         logger.info(f"Reminder parse response: {response_text}")
         json_match = re.search(r'\{[^}]+\}', response_text)
         if json_match:
@@ -512,7 +513,7 @@ async def handle_reminder_request(update: Update, context: ContextTypes.DEFAULT_
 
     await update.message.reply_text("Thưa Chủ nhân, em đang xử lý nhắc nhở ạ...")
 
-    parsed = await parse_reminder_with_claude(text)
+    parsed = await parse_reminder_with_gemini(text)
     if not parsed or "hour" not in parsed or "content" not in parsed:
         await update.message.reply_text(
             "Thưa Chủ nhân, em không hiểu thời gian nhắc nhở ạ.\n"
@@ -1085,22 +1086,21 @@ async def thuoc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Send user message to Claude for a conversational AI response."""
+    """Send user message to Gemini for a conversational AI response."""
     try:
-        message = await asyncio.to_thread(
-            claude_client.messages.create,
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=(
-                "Bạn là Quản gia Ngaos - trợ lý thông minh trong một bot Telegram quản lý thu chi cá nhân. "
-                "Bạn xưng 'em', gọi người dùng là 'Chủ nhân'. "
-                "Luôn bắt đầu câu bằng 'Thưa Chủ nhân' và kết thúc bằng 'ạ'. "
-                "Bạn có thể trả lời các câu hỏi chung, cho lời khuyên tài chính, "
-                "hỗ trợ chủ nhân vui vẻ. Trả lời ngắn gọn, thân thiện, bằng tiếng Việt có dấu."
-            ),
-            messages=[{"role": "user", "content": text}],
+        system_prompt = (
+            "Bạn là Quản gia Ngaos - trợ lý thông minh trong một bot Telegram quản lý thu chi cá nhân. "
+            "Bạn xưng 'em', gọi người dùng là 'Chủ nhân'. "
+            "Luôn bắt đầu câu bằng 'Thưa Chủ nhân' và kết thúc bằng 'ạ'. "
+            "Bạn có thể trả lời các câu hỏi chung, cho lời khuyên tài chính, "
+            "hỗ trợ chủ nhân vui vẻ. Trả lời ngắn gọn, thân thiện, bằng tiếng Việt có dấu."
         )
-        reply = message.content[0].text.strip()
+        response = await asyncio.to_thread(
+            gemini_model.generate_content,
+            [system_prompt, text],
+            generation_config={"max_output_tokens": 1024, "temperature": 0.7},
+        )
+        reply = response.text.strip()
         await update.message.reply_text(reply)
     except Exception as e:
         logger.error(f"AI chat error: {e}")
@@ -1111,47 +1111,28 @@ async def handle_ai_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, tex
 
 
 async def extract_from_screenshot(image_bytes: bytes) -> Optional[dict]:
-    """Use Claude Vision to extract transfer info from a bank screenshot."""
+    """Use Gemini Vision to extract transfer info from a bank screenshot."""
     try:
-        import base64
-        image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        prompt = (
+            "Đây là screenshot chuyển khoản ngân hàng. "
+            "Hãy trích xuất thông tin và trả về JSON duy nhất (không có text khác) với format:\n"
+            '{"amount": <số tiền integer>, "description": "<nội dung chuyển khoản>", "date": "<dd/mm/yy>"}\n'
+            "Nếu không tìm thấy field nào thì để null. "
+            "Số tiền là số nguyên không có dấu chấm/phẩy. "
+            "QUAN TRỌNG: Nếu nội dung chuyển khoản không có dấu tiếng Việt (vd: 'an pizza', 'goi dau'), "
+            "hãy tự động bổ sung dấu tiếng Việt cho đúng (vd: 'ăn pizza', 'gội đầu'). "
+            "Chỉ trả về JSON, không giải thích gì thêm."
+        )
+        image_part = {"mime_type": "image/jpeg", "data": image_bytes}
 
-        message = await asyncio.to_thread(
-            claude_client.messages.create,
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                "Đây là screenshot chuyển khoản ngân hàng. "
-                                "Hãy trích xuất thông tin và trả về JSON duy nhất (không có text khác) với format:\n"
-                                '{"amount": <số tiền integer>, "description": "<nội dung chuyển khoản>", "date": "<dd/mm/yy>"}\n'
-                                "Nếu không tìm thấy field nào thì để null. "
-                                "Số tiền là số nguyên không có dấu chấm/phẩy. "
-                                "QUAN TRỌNG: Nếu nội dung chuyển khoản không có dấu tiếng Việt (vd: 'an pizza', 'goi dau'), "
-                                "hãy tự động bổ sung dấu tiếng Việt cho đúng (vd: 'ăn pizza', 'gội đầu'). "
-                                "Chỉ trả về JSON, không giải thích gì thêm."
-                            ),
-                        },
-                    ],
-                }
-            ],
+        response = await asyncio.to_thread(
+            gemini_model.generate_content,
+            [prompt, image_part],
+            generation_config={"max_output_tokens": 1024, "temperature": 0.0},
         )
 
-        response_text = message.content[0].text.strip()
-        logger.info(f"Claude Vision response: {response_text}")
+        response_text = response.text.strip()
+        logger.info(f"Gemini Vision response: {response_text}")
 
         # Parse JSON from response
         json_match = re.search(r'\{[^}]+\}', response_text)
@@ -1164,7 +1145,7 @@ async def extract_from_screenshot(image_bytes: bytes) -> Optional[dict]:
             }
         return None
     except Exception as e:
-        logger.error(f"Claude Vision OCR error: {e}")
+        logger.error(f"Gemini Vision OCR error: {e}")
         return None
 
 
@@ -1808,7 +1789,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_memory(bio)
         image_bytes = bio.getvalue()
 
-        # Extract info using Claude Vision
+        # Extract info using Gemini Vision
         extracted = await extract_from_screenshot(image_bytes)
 
         if not extracted:
