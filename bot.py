@@ -46,7 +46,14 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 ALLOWED_USERS = set()
 if ALLOWED_USER_IDS:
-    ALLOWED_USERS = {int(uid.strip()) for uid in ALLOWED_USER_IDS.split(",") if uid.strip()}
+    for uid in ALLOWED_USER_IDS.split(","):
+        uid = uid.strip()
+        if not uid:
+            continue
+        try:
+            ALLOWED_USERS.add(int(uid))
+        except ValueError:
+            logger.warning(f"Bỏ qua ALLOWED_USER_IDS không hợp lệ: {uid!r}")
 
 # Initialize Gemini client for parsing, chat, and Vision OCR
 genai.configure(api_key=GEMINI_API_KEY)
