@@ -102,7 +102,6 @@ reminder_counter: int = 0
 MEDICATION_HISTORY_FILE = "medication_history.json"
 # medication -> (next_med_display, next_callback_key, delay_seconds) or None to end the chain
 MEDICATION_CHAIN = {
-    "Gaviscon": ("canxi", "canxi", 2 * 3600),
     "canxi": ("sắt", "sat", 2 * 3600),
     "sắt": None,  # handled by post-iron eat reminder, which then schedules vitamin
     "vitamin": ("canxi", "canxi", 2 * 3600),
@@ -782,7 +781,7 @@ async def show_medication_confirmation(
     """Show 'Lưu lại / Huỷ' confirmation for a medication.
 
     `taken_at` defaults to now; pass an earlier datetime when the user
-    reports the time they took the med (e.g. "đã uống Gaviscon lúc 12:19").
+    reports the time they took the med (e.g. "đã uống canxi lúc 12:19").
     """
     token = uuid.uuid4().hex[:10]
     if is_query:
@@ -856,9 +855,7 @@ def parse_medication_taken_text(text: str) -> Optional[dict]:
     normalized = unicodedata.normalize("NFC", text.lower())
     if "đã uống" not in normalized and "da uong" not in normalized:
         return None
-    if re.search(r'\bgaviscon\b', normalized):
-        medication = "Gaviscon"
-    elif re.search(r'\bcanxi\b', normalized):
+    if re.search(r'\bcanxi\b', normalized):
         medication = "canxi"
     elif re.search(r'\bsắt\b', normalized) or re.search(r'\bsat\b', normalized):
         medication = "sắt"
@@ -1091,7 +1088,7 @@ async def thuoc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not items:
         await update.message.reply_text(
             "Thưa Chủ nhân, chưa có lịch sử uống thuốc nào ạ.\n\n"
-            "Chủ nhân xinh đẹp bắt đầu bằng cách nhắn: đã uống Gaviscon"
+            "Chủ nhân xinh đẹp bắt đầu bằng cách nhắn: đã uống canxi"
         )
         return
 
@@ -1314,9 +1311,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  /nhacnho - Xem danh sách nhắc nhở\n"
         f"  /xoanhac <id> - Huỷ nhắc nhở\n\n"
         f"Nhắc uống thuốc ạ:\n"
-        f"  Nhắn: đã uống Gaviscon - Bắt đầu chuỗi nhắc\n"
-        f"  Sau 2h em sẽ nhắc uống canxi (kèm nút)\n"
-        f"  Sau 2h nữa em sẽ nhắc uống sắt (kèm nút)\n"
+        f"  Nhắn: đã uống canxi - Bắt đầu chuỗi nhắc\n"
+        f"  Sau 2h em sẽ nhắc uống sắt (kèm nút)\n"
         f"  Sau 30 phút em sẽ nhắc đi ăn\n"
         f"  Sau 30 phút nữa em sẽ nhắc uống vitamin (kèm nút)\n"
         f"  Sau 2h nữa em sẽ nhắc uống canxi lần 2 (hoàn thành ngày)\n"
