@@ -105,7 +105,7 @@ MEDICATION_CHAIN = {
     "Gaviscon": ("canxi", "canxi", 2 * 3600),
     "canxi": ("sắt", "sat", 2 * 3600),
     "sắt": None,  # handled by post-iron eat reminder, which then schedules vitamin
-    "vitamin": None,
+    "vitamin": ("canxi", "canxi", 2 * 3600),
 }
 MED_CALLBACK_MAP = {"canxi": "canxi", "sat": "sắt", "vitamin": "vitamin"}
 MED_DELETE_WINDOW_SECONDS = 120  # 2 minutes to delete after saving
@@ -1301,6 +1301,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Sau 2h nữa em sẽ nhắc uống sắt (kèm nút)\n"
         f"  Sau 30 phút em sẽ nhắc đi ăn\n"
         f"  Sau 30 phút nữa em sẽ nhắc uống vitamin (kèm nút)\n"
+        f"  Sau 2h nữa em sẽ nhắc uống canxi (kèm nút)\n"
         f"  Nếu lỡ huỷ confirm, Chủ nhân nhắn lại 'đã uống canxi/sắt/vitamin' để lưu ạ.\n"
         f"  Nhắc thủ công: nhắc uống sắt 30 phút nữa\n"
         f"                 nhắc uống vitamin 1 tiếng nữa\n"
