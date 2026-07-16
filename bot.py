@@ -653,6 +653,16 @@ def delete_medication_entry(user_id: int, entry_id: str) -> Optional[dict]:
     return None
 
 
+def count_medication_today(user_id: int, medication: str, on_date: str) -> int:
+    """Count how many `medication` entries the user logged on `on_date` (YYYY-MM-DD)."""
+    history = load_medication_history()
+    return sum(
+        1
+        for item in history.get(str(user_id), [])
+        if item.get("medication") == medication and item.get("date") == on_date
+    )
+
+
 async def send_medication_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     """JobQueue callback - remind user to take next medication with a button."""
     job = context.job
@@ -674,6 +684,7 @@ def schedule_next_medication(
     chat_id: int,
     current_med: str,
     taken_at: datetime,
+    user_id: int,
 ) -> Optional[Tuple[str, datetime, str]]:
     """Schedule next medication reminder anchored at taken_at + chain delay.
 
@@ -681,6 +692,13 @@ def schedule_next_medication(
     """
     chain = MEDICATION_CHAIN.get(current_med)
     if not chain:
+        return None
+    # Canxi is taken twice a day: the 1st dose chains to sắt, the 2nd dose
+    # (after vitamin) completes the day. This entry isn't logged yet, so a
+    # prior canxi today means the one being saved now is the 2nd.
+    if current_med == "canxi" and count_medication_today(
+        user_id, "canxi", taken_at.strftime("%Y-%m-%d")
+    ) >= 1:
         return None
     next_med, next_key, delay_seconds = chain
 
@@ -942,7 +960,7 @@ async def _medication_save(query, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Sau đó em sẽ nhắc uống vitamin lúc {vitamin_time.strftime('%H:%M')} ạ."
         )
     else:
-        scheduled = schedule_next_medication(context, chat_id, medication, taken_at)
+        scheduled = schedule_next_medication(context, chat_id, medication, taken_at, user_id)
         if scheduled:
             next_med, reminder_time, next_job_name = scheduled
             next_lines.append(
@@ -1301,7 +1319,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Sau 2h nữa em sẽ nhắc uống sắt (kèm nút)\n"
         f"  Sau 30 phút em sẽ nhắc đi ăn\n"
         f"  Sau 30 phút nữa em sẽ nhắc uống vitamin (kèm nút)\n"
-        f"  Sau 2h nữa em sẽ nhắc uống canxi (kèm nút)\n"
+        f"  Sau 2h nữa em sẽ nhắc uống canxi lần 2 (hoàn thành ngày)\n"
         f"  Nếu lỡ huỷ confirm, Chủ nhân nhắn lại 'đã uống canxi/sắt/vitamin' để lưu ạ.\n"
         f"  Nhắc thủ công: nhắc uống sắt 30 phút nữa\n"
         f"                 nhắc uống vitamin 1 tiếng nữa\n"
